@@ -61,11 +61,11 @@ typedef enum {
 #define HDLC_ESCAPE_7D   0x5D
 
 
-#define HDLC_MIN_FRAME_SIZE 6 // min długość ramki
-#define HDLC_MAX_FRAME_SIZE 3506 //max długość ramki
+#define HDLC_MIN_FRAME_SIZE 6 // min długość ramki (bez znaków początku i końca oraz puste dane)
+#define HDLC_MAX_FRAME_SIZE 3506 //max długość całlkowitej ramki
 #define MAX_DATA_LEN 3500 // Max długość danych w ramce
 
-#define BUFFER_SIZE 500 // rozmiar do mojego bufora
+#define BUFFER_SIZE 500 // rozmiar do mojego bufora na dane z czujnika
 
 
 
@@ -184,8 +184,14 @@ HAL_StatusTypeDef PWM_DMA_AddValue(uint16_t angle) {
     if (pulse_ticks < SERVO_MIN_TICKS || pulse_ticks > SERVO_MAX_TICKS) {
         return HAL_ERROR;
     }
-
-    pwm_handler.pwm_values[pwm_handler.total_values++] = (uint16_t)pulse_ticks;
+    //jest to zabezpieczenie aby uniknąć konfliktu jak DMA chodzi i chcemy dodać wartość
+    //stopuje przed dodaniem wartości. Dzięki temu DMA nie będzie jednocześnie odczytywać lub modyfikować bufora, gdy jest dodawana nowa wartość
+    if (pwm_handler.is_running = 1){
+    	HAL_NVIC_DisableIRQ(DMA2_Stream1_IRQn);
+    	pwm_handler.pwm_values[pwm_handler.total_values++] = (uint16_t)pulse_ticks;
+        HAL_NVIC_EnableIRQ(DMA2_Stream1_IRQn);
+    }
+    else{pwm_handler.pwm_values[pwm_handler.total_values++] = (uint16_t)pulse_ticks;}
     return HAL_OK;
 }
 
@@ -199,9 +205,7 @@ void PWM_DMA_Start(void) {
     pwm_handler.is_running = 1;
 
     // Start PWM z DMA
-    HAL_TIM_PWM_Start_DMA(pwm_handler.htim, TIM_CHANNEL_1,
-                          (uint32_t*)pwm_handler.pwm_values,
-                          pwm_handler.total_values);
+    HAL_TIM_PWM_Start_DMA(pwm_handler.htim, TIM_CHANNEL_1, (uint32_t*)pwm_handler.pwm_values, pwm_handler.total_values);
 }
 
 void PWM_DMA_Stop(void) {
@@ -213,7 +217,7 @@ void PWM_DMA_Stop(void) {
     pwm_handler.is_running = 0;
 }
 
-// DMA callback
+// DMA callback pokazuje który indeks czyli jaka wartość jest teraz używana
 void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim) {
     if (htim != pwm_handler.htim || !pwm_handler.is_running) {
         return;
@@ -436,6 +440,9 @@ uint8_t USART_kbhit(){
 	}
 
 
+
+
+
 // Struktura pakietu
 typedef struct {
     uint8_t cmd_type;    // Typ komendy
@@ -448,7 +455,6 @@ typedef struct {
 uint8_t tempbufanswer[MAX_DATA_LEN];
 size_t bufIndex = 0;
 
-
 // Funkcja do dodawania odpowiedzi do bufora
 void addToResponse(uint8_t* data, uint8_t len) {
     if (bufIndex + len <= MAX_DATA_LEN) {
@@ -456,237 +462,250 @@ void addToResponse(uint8_t* data, uint8_t len) {
         bufIndex += len;
     }
 }
+// funkcja sprawdzająca, czy bufor odpowiedzi zawiera wyłącznie komunikaty "ERROR "
+uint8_t allResponsesAreError(void) {
+    if (bufIndex == 0) return 0; // Bufor pusty - nie traktujemy jako same błędy
+
+    // długość nie jest wielokrotnością 6, nie są same bloki "ERROR "
+    if (bufIndex % 6 != 0) return 0;
+
+    uint16_t numBlocks = bufIndex / 6;
+
+    for (uint16_t i = 0; i < numBlocks; i++) {
+        //ERROR plus spacja
+        if (memcmp(&tempbufanswer[i * 6], "ERROR ", 6) != 0)
+            return 0; // Znaleziono blok inny niż "ERROR "
+    }
+
+    return 1; // Wszystkie bloki to "ERROR "
+}
+
+// ---------------- Handler dla SET1 i SET2 ----------------
+  static void SET1or2(uint8_t *cmdData, uint16_t length) {
+       if (length != 9 || cmdData[length - 1] != ']') {
+           uint8_t resp[] = "ERROR";
+           addToResponse(resp, sizeof(resp) - 1);
+           return;
+       }
+       uint16_t value = 0;
+       for (uint16_t i = 5; i < 8; i++) {
+           if (cmdData[i] < '0' || cmdData[i] > '9') {
+               if (cmdData[3] == '1') {
+                   uint8_t resp[] = "S1 INVALID FORMAT ";
+                   addToResponse(resp, sizeof(resp) - 1);
+               } else {
+                   uint8_t resp[] = "S2 INVALID FORMAT ";
+                   addToResponse(resp, sizeof(resp) - 1);
+               }
+               return;
+           }
+           value = value * 10 + (cmdData[i] - '0');
+       }
+       if (value > 180) {
+           if (cmdData[3] == '1') {
+               uint8_t resp[] = "S1 INVALID FORMAT ";
+               addToResponse(resp, sizeof(resp) - 1);
+           } else {
+               uint8_t resp[] = "S2 INVALID FORMAT ";
+               addToResponse(resp, sizeof(resp) - 1);
+           }
+           return;
+       }
+       uint16_t pulse_ticks = SERVO_MIN_TICKS + (value * (SERVO_MAX_TICKS - SERVO_MIN_TICKS) / 180);
+       if (cmdData[3] == '1') {
+           __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pulse_ticks);
+           uint8_t resp[] = "S1 SET ";
+           addToResponse(resp, sizeof(resp) - 1);
+       } else {
+           __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, pulse_ticks);
+           uint8_t resp[] = "S2 SET ";
+           addToResponse(resp, sizeof(resp) - 1);
+       }
+   }
+
+   // ---------------- Handler dla ADDDMA ----------------
+  static void ADDDMA(uint8_t* cmdData, uint16_t length) {
+       if (length != 11 || cmdData[length - 1] != ']') {
+           uint8_t resp[] = "DMA INVALID FORMAT";
+           addToResponse(resp, sizeof(resp) - 1);
+           return;
+       }
+       uint16_t value = 0;
+       for (uint16_t i = 7; i < 10; i++) {
+           if (cmdData[i] < '0' || cmdData[i] > '9') {
+               uint8_t resp[] = "DMA INVALID FORMAT";
+               addToResponse(resp, sizeof(resp) - 1);
+               return;
+           }
+           value = value * 10 + (cmdData[i] - '0');
+       }
+       if (value > 180) {
+           uint8_t resp[] = "DMA INVALID FORMAT";
+           addToResponse(resp, sizeof(resp) - 1);
+           return;
+       }
+       HAL_StatusTypeDef status = PWM_DMA_AddValue(value);
+       if (status == HAL_OK) {
+           uint8_t resp[] = "DMA ADDED";
+           addToResponse(resp, sizeof(resp) - 1);
+       } else {
+           uint8_t resp[] = "DMA INVALID FORMAT";
+           addToResponse(resp, sizeof(resp) - 1);
+       }
+   }
+
+   // ---------------- Handler dla SAUTO ----------------
+  static void SAUTO(uint8_t *cmdData, uint16_t length) {
+       if (length != 8 || cmdData[length - 1] != ']') {
+           uint8_t resp[] = "SAUTO INVALID FORMAT";
+           addToResponse(resp, sizeof(resp) - 1);
+           return;
+       }
+       uint8_t param = cmdData[6];
+       if (param == '1') {
+           PWM_DMA_Start();
+           uint8_t resp[] = "SAUTO ON";
+           addToResponse(resp, sizeof(resp) - 1);
+       } else if (param == '0') {
+           PWM_DMA_Stop();
+           uint8_t resp[] = "SAUTO OFF";
+           addToResponse(resp, sizeof(resp) - 1);
+       }
+   }
+
+   // ---------------- Handler dla UA? ----------------
+  static void UA(uint8_t* cmdData, uint16_t length) {
+       uint16_t ms = htim6.Init.Period + 1;
+       // Format: "UA " + 4-cyfrowa liczba, bez znaku '\0'
+       uint8_t resp[7];
+       resp[0] = 'U';
+       resp[1] = 'A';
+       resp[2] = ' ';
+       resp[3] = '0' + (ms / 1000);         // tysiące
+       resp[4] = '0' + ((ms % 1000) / 100);   // setki
+       resp[5] = '0' + ((ms % 100) / 10);     // dziesiątki
+       resp[6] = '0' + (ms % 10);             // jedności
+       addToResponse(resp, 7);
+   }
+
+   // ---------------- Handler dla UA[xxx] ----------------
+  static void UAxxx(uint8_t *cmdData, uint16_t length) {
+       if (length != 8 || cmdData[length - 1] != ']') {
+           uint8_t resp[] = "ERROR";
+           addToResponse(resp, sizeof(resp) - 1);
+           return;
+       }
+       uint16_t value = 0;
+       for (uint16_t i = 3; i < 7; i++) {
+           if (cmdData[i] < '0' || cmdData[i] > '9') {
+               uint8_t resp[] = "ERROR";
+               addToResponse(resp, sizeof(resp) - 1);
+               return;
+           }
+           value = value * 10 + (cmdData[i] - '0');
+       }
+       if (value >= 10 && value <= 1000) {
+           SetUltrasonicInterval(value);
+           uint8_t resp[] = "UA SET";
+           addToResponse(resp, sizeof(resp) - 1);
+       }
+   }
+
+   // ---------------- Handler dla BUF ----------------
+  static void BUF(uint8_t *cmdData, uint16_t length) {
+       if (length != 3) {
+           uint8_t resp[] = "ERROR";
+           addToResponse(resp, sizeof(resp) - 1);
+           return;
+       }
+       if (CircularBuffer_IsEmpty(&cb)) {
+           uint8_t resp[] = "NO DATA";
+           addToResponse(resp, sizeof(resp) - 1);
+           return;
+       }
+       float value;
+       for (int i = 0; i < 20; i++) {
+           if (CircularBuffer_Get(&cb, &value)) {
+               char temp[16];
+               int len = snprintf(temp, sizeof(temp), "%.2f ", value);
+               addToResponse((uint8_t*)temp, (uint8_t)len);
+           }
+       }
+   }
+
+   // ---------------- Handler dla BUFALL ----------------
+  static void BUFALL(uint8_t *cmdData, uint16_t length) {
+       if (length != 6) {
+           uint8_t resp[] = "ERROR";
+           addToResponse(resp, sizeof(resp) - 1);
+           return;
+       }
+       if (CircularBuffer_IsEmpty(&cb)) {
+           uint8_t resp[] = "NO DATA";
+           addToResponse(resp, sizeof(resp) - 1);
+           return;
+       }
+       float value;
+       while (CircularBuffer_Get(&cb, &value)) {
+           char temp[16];
+           int len = snprintf(temp, sizeof(temp), "%.2f ", value);
+           addToResponse((uint8_t*)temp, (uint8_t)len);
+       }
+   }
+
+   // ---------------- Handler dla BUFN[xxx,xxx] ----------------
+  static void BUFN(uint8_t *cmdData, uint16_t length) {
+       // Oczekujemy dokładnie 13 bajtów: "BUFN[xxx,xxx]"
+       if (length != 13 || cmdData[length - 1] != ']') {
+           uint8_t resp[] = "BUFN INVALID FORMAT";
+           addToResponse(resp, sizeof(resp) - 1);
+           return;
+       }
+       if (cmdData[8] != ',') {
+           uint8_t resp[] = "BUFN INVALID FORMAT";
+           addToResponse(resp, sizeof(resp) - 1);
+           return;
+       }
+       uint16_t start = 0, end = 0;
+       for (uint8_t i = 5; i < 8; i++) {
+           if (!isdigit(cmdData[i])) {
+               uint8_t resp[] = "BUFN INVALID START";
+               addToResponse(resp, sizeof(resp) - 1);
+               return;
+           }
+           start = start * 10 + (cmdData[i] - '0');
+       }
+       for (uint8_t i = 9; i < 12; i++) {
+           if (!isdigit(cmdData[i])) {
+               uint8_t resp[] = "BUFN INVALID END";
+               addToResponse(resp, sizeof(resp) - 1);
+               return;
+           }
+           end = end * 10 + (cmdData[i] - '0');
+       }
+       if (start > 500 || end > 500 || start > end) {
+           uint8_t resp[] = "BUFN INVALID RANGE";
+           addToResponse(resp, sizeof(resp) - 1);
+           return;
+       }
+       uint16_t total = CircularBuffer_Size(&cb);
+       if (start >= total || end >= total) {
+           uint8_t resp[] = "BUFN INVALID RANGE";
+           addToResponse(resp, sizeof(resp) - 1);
+           return;
+       }
+       char outStr[32];
+       for (uint16_t i = start; i <= end; i++) {
+           float value;
+           if (CircularBuffer_Peek(&cb, i, &value)) {
+               int len = snprintf(outStr, sizeof(outStr), "%.2f ", value);
+               addToResponse((uint8_t*)outStr, (uint8_t)len);
+           }
+       }
+   }
+
 void processCommand(uint8_t *cmdData, uint16_t length) {
 
-    // ---------------- Handler dla SET1 i SET2 ----------------
-    void SET1or2(uint8_t *cmdData, uint16_t length) {
-        // Format musi mieć dokładnie 9 bajtów: "SET1[xxx]" lub "SET2[xxx]"
-        if (length != 9 || cmdData[length - 1] != ']') {
-            uint8_t resp[] = "ERROR";
-            addToResponse(resp, sizeof(resp) - 1);
-            return;
-        }
-        uint16_t value = 0;
-        for (uint16_t i = 5; i < 8; i++) {
-            if (cmdData[i] < '0' || cmdData[i] > '9') {
-                if (cmdData[3] == '1') {
-                    uint8_t resp[] = "S1 INVALID FORMAT ";
-                    addToResponse(resp, sizeof(resp) - 1);
-                } else {
-                    uint8_t resp[] = "S2 INVALID FORMAT ";
-                    addToResponse(resp, sizeof(resp) - 1);
-                }
-                return;
-            }
-            value = value * 10 + (cmdData[i] - '0');
-        }
-        if (value > 180) {
-            if (cmdData[3] == '1') {
-                uint8_t resp[] = "S1 INVALID FORMAT ";
-                addToResponse(resp, sizeof(resp) - 1);
-            } else {
-                uint8_t resp[] = "S2 INVALID FORMAT ";
-                addToResponse(resp, sizeof(resp) - 1);
-            }
-            return;
-        }
-        // Oblicz impuls PWM
-        uint16_t pulse_ticks = SERVO_MIN_TICKS + (value * (SERVO_MAX_TICKS - SERVO_MIN_TICKS) / 180);
-        if (cmdData[3] == '1') {
-            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pulse_ticks);
-            uint8_t resp[] = "S1 SET ";
-            addToResponse(resp, sizeof(resp) - 1);
-        } else {
-            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, pulse_ticks);
-            uint8_t resp[] = "S2 SET ";
-            addToResponse(resp, sizeof(resp) - 1);
-        }
-    }
-
-    // ---------------- Handler dla ADDDMA ----------------
-    void ADDDMA(uint8_t* cmdData, uint16_t length) {
-        if (length != 11 || cmdData[length - 1] != ']') {
-            uint8_t resp[] = "DMA INVALID FORMAT";
-            addToResponse(resp, sizeof(resp) - 1);
-            return;
-        }
-        uint16_t value = 0;
-        for (uint16_t i = 7; i < 10; i++) {
-            if (cmdData[i] < '0' || cmdData[i] > '9') {
-                uint8_t resp[] = "DMA INVALID FORMAT";
-                addToResponse(resp, sizeof(resp) - 1);
-                return;
-            }
-            value = value * 10 + (cmdData[i] - '0');
-        }
-        if (value > 180) {
-            uint8_t resp[] = "DMA INVALID FORMAT";
-            addToResponse(resp, sizeof(resp) - 1);
-            return;
-        }
-        HAL_StatusTypeDef status = PWM_DMA_AddValue(value);
-        if (status == HAL_OK) {
-            uint8_t resp[] = "DMA ADDED";
-            addToResponse(resp, sizeof(resp) - 1);
-        } else {
-            uint8_t resp[] = "DMA INVALID FORMAT";
-            addToResponse(resp, sizeof(resp) - 1);
-        }
-    }
-
-    // ---------------- Handler dla SAUTO ----------------
-    void SAUTO(uint8_t *cmdData, uint16_t length) {
-        // Format: "SAUTO[1]" lub "SAUTO[0]", 8 bajtów
-        if (length != 8 || cmdData[length - 1] != ']') {
-            uint8_t resp[] = "SAUTO INVALID FORMAT";
-            addToResponse(resp, sizeof(resp) - 1);
-            return;
-        }
-        uint8_t param = cmdData[6];
-        if (param == '1') {
-            PWM_DMA_Start();
-            uint8_t resp[] = "SAUTO ON";
-            addToResponse(resp, sizeof(resp) - 1);
-        } else if (param == '0') {
-            PWM_DMA_Stop();
-            uint8_t resp[] = "SAUTO OFF";
-            addToResponse(resp, sizeof(resp) - 1);
-        }
-    }
-
-    // ---------------- Handler dla UA? ----------------
-    void UA(uint8_t* cmdData, uint16_t length) {
-        // pobiera wartość z timera
-        uint16_t ms = htim6.Init.Period + 1;
-        uint8_t resp[7];
-        resp[0] = 'U';
-        resp[1] = 'A';
-        resp[2] = ' ';
-        resp[3] = '0' + (ms / 1000);         // tys
-        resp[4] = '0' + ((ms % 1000) / 100); // setki
-        resp[5] = '0' + ((ms % 100) / 10);   // dzies
-        resp[6] = '0' + (ms % 10);           // jed
-        addToResponse(resp, 7);
-    }
-
-
-    // ---------------- Handler dla UA[xxx] ----------------
-    void UAxxx(uint8_t *cmdData, uint16_t length) {
-        if (length != 8 || cmdData[length - 1] != ']') {
-            uint8_t resp[] = "ERROR";
-            addToResponse(resp, sizeof(resp) - 1);
-            return;
-        }
-        uint16_t value = 0;
-        for (uint16_t i = 3; i < 7; i++) {
-            if (cmdData[i] < '0' || cmdData[i] > '9') {
-                uint8_t resp[] = "ERROR";
-                addToResponse(resp, sizeof(resp) - 1);
-                return;
-            }
-            value = value * 10 + (cmdData[i] - '0');
-        }
-        if (value >= 10 && value <= 1000) {
-            SetUltrasonicInterval(value);
-            uint8_t resp[] = "UA SET";
-            addToResponse(resp, sizeof(resp) - 1);
-        }
-    }
-
-    // ---------------- Handler dla BUF ----------------
-    void BUF(uint8_t *cmdData, uint16_t length) {
-        if (length != 3) {
-            uint8_t resp[] = "ERROR";
-            addToResponse(resp, sizeof(resp) - 1);
-            return;
-        }
-        if (CircularBuffer_IsEmpty(&cb)) {
-            uint8_t resp[] = "NO DATA";
-            addToResponse(resp, sizeof(resp) - 1);
-            return;
-        }
-        float value;
-        for (int i = 0; i < 20; i++) {
-            if (CircularBuffer_Get(&cb, &value)) {
-                char temp[16];
-                int len = snprintf(temp, sizeof(temp), "%.2f ", value);
-                addToResponse((uint8_t*)temp, (uint8_t)len);
-            }
-        }
-    }
-
-    // ---------------- Handler dla BUFALL ----------------
-    void BUFALL(uint8_t *cmdData, uint16_t length) {
-        if (length != 6) {
-            uint8_t resp[] = "ERROR";
-            addToResponse(resp, sizeof(resp) - 1);
-            return;
-        }
-        if (CircularBuffer_IsEmpty(&cb)) {
-            uint8_t resp[] = "NO DATA";
-            addToResponse(resp, sizeof(resp) - 1);
-            return;
-        }
-        float value;
-        while (CircularBuffer_Get(&cb, &value)) {
-            char temp[16];
-            int len = snprintf(temp, sizeof(temp), "%.2f ", value);
-            addToResponse((uint8_t*)temp, (uint8_t)len);
-        }
-    }
-
-    // ---------------- Handler dla BUFN[xxx,xxx] ----------------
-    void BUFN(uint8_t *cmdData, uint16_t length) {
-        // Oczekujemy dokładnie 13 bajtów: "BUFN[xxx,xxx]"
-        if (length != 13 || cmdData[length - 1] != ']') {
-            uint8_t resp[] = "BUFN INVALID FORMAT";
-            addToResponse(resp, sizeof(resp) - 1);
-            return;
-        }
-        if (cmdData[8] != ',') {
-            uint8_t resp[] = "BUFN INVALID FORMAT";
-            addToResponse(resp, sizeof(resp) - 1);
-            return;
-        }
-        uint16_t start = 0, end = 0;
-        for (uint8_t i = 5; i < 8; i++) {
-            if (!isdigit(cmdData[i])) {
-                uint8_t resp[] = "BUFN INVALID START";
-                addToResponse(resp, sizeof(resp) - 1);
-                return;
-            }
-            start = start * 10 + (cmdData[i] - '0');
-        }
-        for (uint8_t i = 9; i < 12; i++) {
-            if (!isdigit(cmdData[i])) {
-                uint8_t resp[] = "BUFN INVALID END";
-                addToResponse(resp, sizeof(resp) - 1);
-                return;
-            }
-            end = end * 10 + (cmdData[i] - '0');
-        }
-        if (start > 500 || end > 500 || start > end) {
-            uint8_t resp[] = "BUFN INVALID RANGE";
-            addToResponse(resp, sizeof(resp) - 1);
-            return;
-        }
-        uint16_t total = CircularBuffer_Size(&cb);
-        if (start >= total || end >= total) {
-            uint8_t resp[] = "BUFN INVALID RANGE";
-            addToResponse(resp, sizeof(resp) - 1);
-            return;
-        }
-        char outStr[32];
-        for (uint16_t i = start; i <= end; i++) {
-            float value;
-            if (CircularBuffer_Peek(&cb, i, &value)) {
-                int len = snprintf(outStr, sizeof(outStr), "%.2f ", value);
-                addToResponse((uint8_t*)outStr, (uint8_t)len);
-            }
-        }
-    }
-
-    // ---------------- Główna logika wyboru komend ----------------
     if (length >= 5 && ((memcmp(cmdData, "SET1[", 5) == 0) || (memcmp(cmdData, "SET2[", 5) == 0))) {
         SET1or2(cmdData, length);
     } else if (length >= 7 && (memcmp(cmdData, "ADDDMA[", 7) == 0)) {
@@ -708,47 +727,46 @@ void processCommand(uint8_t *cmdData, uint16_t length) {
         addToResponse(resp, sizeof(resp) - 1);
     }
 }
-
-
 void processMultipleCommands(uint8_t *cmdData, uint16_t totalLength) {
     uint16_t pos = 0;
     while (pos < totalLength) {
-        // pomija wszystkie średniki
-        while (pos < totalLength && cmdData[pos] == ';') {
+        // Pomijam bajty separatora (0x3B to ';' w ASCII)
+        while (pos < totalLength && cmdData[pos] == 0x3B) {
             pos++;
         }
         if (pos >= totalLength)
             break;
+
         uint16_t start = pos;
-        // szuka średnika lub końca bufora
-        while (pos < totalLength && cmdData[pos] != ';') {
+        // Szuka separatora lub końca bufora
+        while (pos < totalLength && cmdData[pos] != 0x3B) {
             pos++;
         }
         uint16_t cmdLength = pos - start;
         if (cmdLength > 0) {
-            processCommand(&cmdData[start], cmdLength);
+            processCommand(&cmdData[start], cmdLength);  // Przekazuje surowe bajty
         }
     }
 }
 
-
-void HDLC_ParseFrame(const uint8_t* frame, uint16_t length)
-{
-    if (length < HDLC_MIN_FRAME_SIZE) return;
+void HDLC_ParseFrame(const uint8_t* frame, uint16_t length) {
+    if (length < HDLC_MIN_FRAME_SIZE)
+        return;
 
     uint8_t addrSrc = frame[0];
     uint8_t addrDst = frame[1];
     uint16_t dataLen = (frame[2] << 8) | frame[3];
 
     if (dataLen + 5 > length) {
-        const char* message = "LEN NOT MATCH";
-        HDLC_SendFrame(addrSrc, addrDst, (const uint8_t*)message, (uint16_t)(sizeof(message) - 1));
+        uint8_t message[] = "LEN NOT MATCH";
+        HDLC_SendFrame(addrSrc, addrDst, message, sizeof(message) - 1);
         return;
     }
 
     const uint8_t* dataPtr = &frame[4];
     uint8_t crcRecv = frame[4 + dataLen];
 
+    // Przygotowanie bufora do obliczenia CRC
     uint8_t tempBuf[4 + dataLen];
     tempBuf[0] = addrSrc;
     tempBuf[1] = addrDst;
@@ -756,28 +774,34 @@ void HDLC_ParseFrame(const uint8_t* frame, uint16_t length)
     tempBuf[3] = frame[3];
     memcpy(&tempBuf[4], dataPtr, dataLen);
 
+    // Oblicz CRC
     uint8_t crcCalc = computeCRC8(tempBuf, 4 + dataLen);
     if (crcCalc != crcRecv) {
-        const char* message = "INVALID CRC";
-        HDLC_SendFrame(addrSrc, addrDst, (const uint8_t*)message, (uint16_t)(sizeof(message) - 1));
+        uint8_t message[] = "INVALID CRC";
+        HDLC_SendFrame(addrSrc, addrDst, message, sizeof(message) - 1);
         return;
     }
 
-    static char cmdStr[2001];
-    if (dataLen >= sizeof(cmdStr)) return;
-    memcpy(cmdStr, dataPtr, dataLen);
-    cmdStr[dataLen] = 0;
+    static uint8_t cmdBuff[MAX_DATA_LEN];
+    if (dataLen >= MAX_DATA_LEN)  // Zabezpieczenie przed przepełnieniem
+        return;
 
-    // przetwarza wiele komend oddzielonych średnikiem
-    processMultipleCommands((uint8_t*)cmdStr, dataLen);
+    uint16_t cmdLen = dataLen;
+    memcpy(cmdBuff, dataPtr, cmdLen);
 
-    // wysyła odpowiedź dane są zapisane w tempbufanswer i bufIndex
-    HDLC_SendFrame(addrSrc, addrDst, tempbufanswer, (uint16_t)bufIndex);
+    // Przetwarzam wiele komend oddzielonych średnikiem
+    processMultipleCommands(cmdBuff, cmdLen);
 
-    //reset bufora  odpowiedzi
-    memset(tempbufanswer, 0, sizeof(tempbufanswer));
-    bufIndex = 0;
+    // Jeśli bufor odpowiedzi zawiera same "ERROR", ramka jest odrzucana
+    if (!allResponsesAreError()) {
+        HDLC_SendFrame(addrSrc, addrDst, tempbufanswer, (uint16_t)bufIndex);
+
+        // Reset bufora
+        memset(tempbufanswer, 0, sizeof(tempbufanswer));
+        bufIndex = 0;
+    }
 }
+
 
 
 
@@ -788,90 +812,77 @@ void HDLC_ParseFrame(const uint8_t* frame, uint16_t length)
 	    {
 	        uint8_t rxByte = (uint8_t)USART_getchar();
 
-	        // Sprawdzenie czy bufor jest pełny
+	        // sprawdzenie czy bufor jest pełny
 	        if (hdlcInPos >= HDLC_MAX_FRAME_SIZE)
-	        {
-	            // Przepełnienie bufora – odrzucamy ramkę
-	            hdlcRxState = WAITING_FOR_FLAG;
-	            hdlcInPos = 0;
-	            continue;
-	        }
+	           {
+	               hdlcRxState = WAITING_FOR_FLAG;
+	               hdlcInPos = 0;
+	               continue;
+	           }
 
-	        switch (hdlcRxState)
-	        {
-	            case WAITING_FOR_FLAG:
-	                if (rxByte == HDLC_FLAG)
-	                {
-	                    // Rozpoczynamy odbiór ramki
-	                    hdlcInPos = 0;
-	                    hdlcRxState = READING_FRAME;
-	                }
-	                break;
+	           switch (hdlcRxState)
+	           {
+	               case WAITING_FOR_FLAG:
+	                   if (rxByte == HDLC_FLAG)
+	                   {
+	                       // Flaga oznacza początek ramki
+	                       hdlcInPos = 0;
+	                       hdlcRxState = READING_FRAME;
+	                   }
+	                   break;
 
-	            case READING_FRAME:
-	                if (rxByte == HDLC_FLAG)
-	                {
-	                    // Otrzymano flagę końca ramki; jeśli mamy dane, przekazujemy je do parsera
-	                    if (hdlcInPos > 0)
-	                    {
-	                        HDLC_ParseFrame(hdlcInBuf, hdlcInPos);
-	                    }
-	                    // Resetujemy stan i bufor
-	                    hdlcInPos = 0;
-	                    hdlcRxState = WAITING_FOR_FLAG;
-	                }
-	                else if (rxByte == HDLC_ESCAPE)
-	                {
-	                    // Otrzymano bajt escape – przełączamy się na dekodowanie
-	                    hdlcRxState = ESCAPING_BYTE;
-	                }
-	                else
-	                {
-	                    // Dodajemy bajt do bufora
-	                    hdlcInBuf[hdlcInPos++] = rxByte;
-	                }
-	                break;
+	               case READING_FRAME:
+	                   if (rxByte == HDLC_FLAG)
+	                   {
+	                       // Otrzymano flagę - traktujemy ją jako koniec bieżącej ramki
+	                       if (hdlcInPos > 0)
+	                       {
+	                           HDLC_ParseFrame(hdlcInBuf, hdlcInPos);
+	                       }
+	                       // Resetuj bufor, ale ustaw stan na READING_FRAME,
+	                       // bo ten sam bajt 0x7E ma być traktowany jako początek nowej ramki
+	                       hdlcInPos = 0;
+	                       hdlcRxState = READING_FRAME;
+	                   }
+	                   else if (rxByte == HDLC_ESCAPE)
+	                   {
+	                       hdlcRxState = ESCAPING_BYTE;
+	                   }
+	                   else
+	                   {
+	                       hdlcInBuf[hdlcInPos++] = rxByte;
+	                   }
+	                   break;
 
-	            case ESCAPING_BYTE:
-	            {
-	                uint8_t decodedByte;
-	                if (rxByte == HDLC_ESCAPE_7E)
-	                {
-	                    decodedByte = HDLC_FLAG;
-	                }
-	                else if (rxByte == HDLC_ESCAPE_7D)
-	                {
-	                    decodedByte = HDLC_ESCAPE;
-	                }
-	                else
-	                {
-	                    // Nieprawidłowa sekwencja escape – odrzucamy ramkę
-	                    hdlcRxState = WAITING_FOR_FLAG;
-	                    hdlcInPos = 0;
-	                    break;
-	                }
-	                hdlcInBuf[hdlcInPos++] = decodedByte;
-	                // Powracamy do normalnego odbioru
-	                hdlcRxState = READING_FRAME;
-	                break;
-	            }
+	               case ESCAPING_BYTE:
+	               {
+	                   uint8_t decodedByte;
+	                   if (rxByte == HDLC_ESCAPE_7E)
+	                       decodedByte = HDLC_FLAG;
+	                   else if (rxByte == HDLC_ESCAPE_7D)
+	                       decodedByte = HDLC_ESCAPE;
+	                   else
+	                   {
+	                       // Błędna sekwencja escape – odrzucamy ramkę
+	                       hdlcRxState = WAITING_FOR_FLAG;
+	                       hdlcInPos = 0;
+	                       break;
+	                   }
+	                   hdlcInBuf[hdlcInPos++] = decodedByte;
+	                   //powracamy do stanu odbioru ramki
+	                   hdlcRxState = READING_FRAME;
+	               }
+	               break;
 
-	            default:
-	                // Reset stanu przy nieznanym przypadku
-	                hdlcRxState = WAITING_FOR_FLAG;
-	                hdlcInPos = 0;
-	                break;
-	        }
-	    }
-	    return 0;
+	               default:
+	                   hdlcRxState = WAITING_FOR_FLAG;
+	                   hdlcInPos = 0;
+	                   break;
+	           }
+	       }
+	       return 0;
 	}
 
-
-
-
-	//do opowiedzi i tego typu benc, wiec chyba zrobie tak ze jak ramka jest przyjeta i komendy generują odpowiedzi to wpakuje
-	// to do uint8_t data i wyśle dodając wszystko inne aby ramka była poprawna a nie same odpowiedzi z usart_fsenda ...
-	// w sumie to ja już sam nie wiem
 
 	void HDLC_SendFrame(uint8_t addrSrc, uint8_t addrDst,
 	                    const uint8_t* data, uint16_t dataLen)
@@ -943,6 +954,8 @@ void HDLC_ParseFrame(const uint8_t* frame, uint16_t length)
 	}
 
 
+		float dist = 0.0f;
+
 		float GetUltrasonicDistance(void)
 		{
 			//Jeżeli echo zostało przechwycobe
@@ -958,12 +971,10 @@ void HDLC_ParseFrame(const uint8_t* frame, uint16_t length)
 					duration = (arr - echo_start + echo_end);
 				}
 
-				float dist = (float)duration / 58.0f;
+				dist = (float)duration / 58.0f;
 				dist = roundf(dist*100.0f)/100.0f; // zaokrąglenie do 2 miejsc
 
 				CircularBuffer_Put(&cb, dist);
-
-
 
 				echo_captured = 0; // Reset
 				return dist;
@@ -1050,7 +1061,7 @@ int main(void)
   // Start TIM6 do generowania triggera w czujniku
  	    HAL_TIM_Base_Start_IT(&htim6);
 
- 	    // Start TIM3 Input Capture on Channel 1
+ 	    // Start TIM3 Input Capture na chan 1
  	    HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_1); //włącza przerwanie ale w sumie nie wiem czy to tu powinno być w ogóle
 
  	   // startuje pwm
@@ -1074,13 +1085,7 @@ int main(void)
 
 		  //czujnik
 		  // żeby działał to trzeba zrobić tigger na high przez minimum 10 us
-		  float dist = GetUltrasonicDistance();
-		     if (dist >= 0.0f)
-		     {
-		         // Udało się, wypisz se jak chcesz w konsoli
-		    	 // USART_fsend("Dist: %.2f cm\n", dist);
-
-		     }
+		  GetUltrasonicDistance();
 
     /* USER CODE END WHILE */
 
